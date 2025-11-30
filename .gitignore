@@ -1,0 +1,26 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+venv/
+env/
+.venv/
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Streamlit / uploads / data that shouldn't be public
+uploads/
+*.sqlite3
+*.db
+# Python env files / secrets
+.env
+.env.*
+secrets.json
+# Mac/Windows file meta
+*.log

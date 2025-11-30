@@ -1,0 +1,5 @@
+employee_id,name,department,record_type,notes,date
+E001,Anita Rao,Finance,payroll,"Salary processed for Oct, no change",2025-10-30
+E002,Rajesh Kumar,IT,leave,"Approved 2 days leave",2025-11-05
+E003,Sneha Patel,HR,policy,"Submitted ID proof",2025-11-02
+E004,Manoj Singh,Sales,payroll,"Salary delayed due to bank hold",2025-11-10

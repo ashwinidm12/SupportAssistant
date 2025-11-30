@@ -1,0 +1,4 @@
+order_id,customer_email,status,tracking_url,paid,cancelable
+ORD1001,alice@example.com,shipped,https://track.example/ORD1001,yes,no
+ORD1002,bob@example.com,processing,,no,yes
+ORD1003,charlie@example.com,delivered,https://track.example/ORD1003,yes,no

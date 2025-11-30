@@ -1,0 +1,316 @@
+# agent.py
+"""
+Agent wrapper with graceful fallback:
+- If sentence_transformers available -> use embeddings (Chroma)
+- Otherwise -> use lightweight in-memory token-count + cosine fallback
+Provides Agent class used by app.py
+"""
+
+import os
+import json
+import math
+import time
+from typing import List, Dict, Tuple
+
+# data helpers
+def load_json(path: str):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# ---------- try heavy deps (guarded by env var to avoid heavy installs) ----------
+EMBEDDINGS_AVAILABLE = False
+USE_CHROMA = False
+
+# If you want to run without installing heavy models, set env DISABLE_EMBEDDINGS=1
+if not os.environ.get("DISABLE_EMBEDDINGS"):
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        import chromadb  # type: ignore
+        from chromadb.config import Settings  # type: ignore
+        from chromadb.utils import embedding_functions  # type: ignore
+        EMBEDDINGS_AVAILABLE = True
+        USE_CHROMA = True
+    except Exception:
+        EMBEDDINGS_AVAILABLE = False
+        USE_CHROMA = False
+else:
+    EMBEDDINGS_AVAILABLE = False
+    USE_CHROMA = False
+
+
+# ---------- simple tokenizer & count-embedding fallback ----------
+import re
+import numpy as np
+
+_token_re = re.compile(r"\w+")
+def simple_tokens(text: str):
+    return [t.lower() for t in _token_re.findall(text)]
+
+def build_count_vector(tokens: List[str], vocab_map: dict):
+    vec = np.zeros(len(vocab_map), dtype=float)
+    for t in tokens:
+        if t in vocab_map:
+            vec[vocab_map[t]] += 1.0
+    return vec
+
+def cosine_sim(a: np.ndarray, b: np.ndarray):
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+# ---------- Agent class ----------
+class Agent:
+    def __init__(self, faqs_path="data/faqs_large.json", dataset_csv_path="data/dataset.csv"):
+        # load resources
+        self.faqs = load_json(faqs_path)
+        # dataset CSV loader (simple)
+        self.rows = []
+        if os.path.exists(dataset_csv_path):
+            import csv
+            with open(dataset_csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                self.rows = [r for r in reader]
+        # embeddings
+        self.emb_model = None
+        if EMBEDDINGS_AVAILABLE:
+            try:
+                # instantiate sentence-transformers
+                # model name can be custom via env
+                model_name = os.environ.get("SENTENCE_MODEL", "all-MiniLM-L6-v2")
+                self.emb_model = SentenceTransformer(model_name)
+            except Exception:
+                self.emb_model = None
+
+        # If embeddings not available -> build local token vocabulary & document vectors
+        self.vocab = {}
+        self.docs_vectors = []  # will hold vectors for faqs+rows
+        self.doc_sources = []   # parallel list of (type, index) -> ('faq', i) or ('row', i)
+
+        if not self.emb_model:
+            # Build vocab from faqs + rows (top tokens)
+            tokens_all = []
+            for i, f in enumerate(self.faqs):
+                tokens_all += simple_tokens(f.get("question","") + " " + f.get("answer",""))
+            for r in self.rows:
+                tokens_all += simple_tokens(" ".join([str(v) for v in r.values() if v]))
+            # pick unique tokens (we limit vocab size to keep vector small)
+            uniq = []
+            seen = set()
+            for t in tokens_all:
+                if t not in seen and len(t) > 2:
+                    seen.add(t)
+                    uniq.append(t)
+                if len(uniq) >= 2000:
+                    break
+            self.vocab = {t:i for i,t in enumerate(uniq)}
+            # build vectors
+            for i, f in enumerate(self.faqs):
+                txt = (f.get("question","") + " " + f.get("answer","")).lower()
+                vec = build_count_vector(simple_tokens(txt), self.vocab)
+                self.docs_vectors.append(vec)
+                self.doc_sources.append(("faq", i))
+            for i, r in enumerate(self.rows):
+                txt = " ".join([str(v) for v in r.values() if v]).lower()
+                vec = build_count_vector(simple_tokens(txt), self.vocab)
+                self.docs_vectors.append(vec)
+                self.doc_sources.append(("row", i))
+        else:
+            # embeddings available -> optionally create Chroma DB if you like
+            # We'll not auto-create a remote DB here; the app can use client if needed.
+            pass
+
+    def retrieve(self, query: str, top_k: int = 3) -> List[Tuple[float, dict]]:
+        """
+        Return list of (score, source_dict) where source_dict is:
+        - {'type':'faq','source_index':i,'question':..,'answer':..}
+        - or {'type':'row','source_index':i,'row':{...}}
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        if self.emb_model:
+            # embeddings path (if SentenceTransformer available)
+            q_emb = self.emb_model.encode([q])[0]
+            # Use simple nearest neighbors over precomputed embeddings if available
+            # For simplicity here we fallback to FAQ textual matching if we haven't precomputed embeddings.
+            results = []
+            # try simple faq match first
+            for i, f in enumerate(self.faqs):
+                score = self._text_overlap_score(q, f.get("question",""))
+                if score > 0:
+                    results.append((score, {"type":"faq","source_index":i,"question":f.get("question"),"answer":f.get("answer")}))
+            # dataset row matching simple
+            for i, r in enumerate(self.rows):
+                score = self._text_overlap_score(q, " ".join([str(v) for v in r.values() if v]))
+                if score > 0:
+                    results.append((score*0.8, {"type":"row","source_index":i,"row":r}))
+            # sort and return
+            results.sort(key=lambda x: x[0], reverse=True)
+            return results[:top_k] if results else []
+        else:
+            # local vector fallback
+            qvec = build_count_vector(simple_tokens(q.lower()), self.vocab)
+            scored = []
+            for i, vec in enumerate(self.docs_vectors):
+                sc = cosine_sim(qvec, vec)
+                if sc > 0:
+                    src_type, src_idx = self.doc_sources[i]
+                    if src_type == "faq":
+                        f = self.faqs[src_idx]
+                        scored.append((sc, {"type":"faq","source_index":src_idx,"question":f.get("question"),"answer":f.get("answer")}))
+                    else:
+                        row = self.rows[src_idx]
+                        scored.append((sc, {"type":"row","source_index":src_idx,"row":row}))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return scored[:top_k]
+
+    def _text_overlap_score(self, q: str, text: str) -> float:
+        # quick token overlap heuristic
+        qt = set(simple_tokens(q))
+        tt = set(simple_tokens(text))
+        if not qt or not tt:
+            return 0.0
+        return len(qt & tt) / max(1, len(qt))
+
+    def answer(self, query: str) -> str:
+        """
+        Build a concise answer:
+        - If matched FAQ exact -> return FAQ answer
+        - Else -> use match snippets to craft quick reply (or fallback text)
+        """
+        if not query or not query.strip():
+            return "Please type your question."
+
+        matches = self.retrieve(query, top_k=3)
+        if matches:
+            # prefer FAQ match if any
+            for score, src in matches:
+                if src["type"] == "faq":
+                    return src.get("answer","")
+            # otherwise summarize row matches
+            out = []
+            for score, src in matches:
+                if src["type"] == "row":
+                    row = src["row"]
+                    # show short snippet
+                    keys = list(row.keys())[:3]
+                    snippet = ", ".join([f"{k}: {row[k]}" for k in keys])
+                    out.append(f"- {snippet}")
+            return "I found these relevant records:\n" + "\n".join(out) if out else "I couldn't find a direct FAQ — try rephrasing or contact HR at payroll@company.com."
+        # nothing found
+        return "Sorry — I don't have an answer right now. Please contact HR at payroll@company.com."
+
+# convenience factory for app.py
+def make_agent():
+    return Agent()
+# --- append to agent.py (paste exactly) ---
+
+# convenience single-agent singleton (lazy)
+_agent_singleton = None
+
+def _get_agent():
+    global _agent_singleton
+    if _agent_singleton is None:
+        _agent_singleton = make_agent()
+    return _agent_singleton
+
+# Compatibility helpers expected by app.py
+def load_faqs(path: str = "data/faqs_large.json"):
+    """
+    Return FAQ list (list of dicts with question/answer).
+    Called by app.py as agent.load_faqs()
+    """
+    ag = _get_agent()
+    return getattr(ag, "faqs", [])
+
+def load_dataset_csv(path: str = "data/dataset.csv"):
+    """
+    Return dataset rows list (list of dicts). Called by app.py.
+    """
+    ag = _get_agent()
+    return getattr(ag, "rows", [])
+
+def build_suggestions(faqs=None, rows=None, top_n: int = 40):
+    """
+    Simple suggestion builder used in app.py.
+    Accepts faqs/rows (if None, uses data loaded above).
+    Returns a list of suggestion strings.
+    """
+    if faqs is None:
+        faqs = load_faqs()
+    if rows is None:
+        rows = load_dataset_csv()
+
+    suggestions = []
+    # Include short FAQ questions first
+    for f in faqs:
+        q = str(f.get("question","")).strip()
+        if q and len(q.split()) <= 6:
+            suggestions.append(q)
+    # then add some frequent words/phrases from rows (naive)
+    tokens = {}
+    import re
+    token_re = re.compile(r"\w{3,}")
+    for r in rows:
+        for v in r.values():
+            if not v:
+                continue
+            for t in token_re.findall(str(v).lower()):
+                tokens[t] = tokens.get(t, 0) + 1
+    # take top tokens as suggestions
+    top_tokens = sorted(tokens.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    for t,_ in top_tokens:
+        suggestions.append(t)
+    # ensure we don't return more than top_n
+    return suggestions[:top_n]
+
+def should_escalate(user_query: str) -> bool:
+    """
+    Mirror the sensitive-topic escalation check used earlier.
+    """
+    sensitive = [
+        "salary", "pay", "payroll", "termination", "fired", "dismiss",
+        "legal", "lawsuit", "notice period", "resign", "disciplinary", "bonus", "ctc", "increment",
+        "order", "refund", "cancel", "charged", "payment", "transaction"
+    ]
+    u = (user_query or "").lower()
+    return any(k in u for k in sensitive)
+
+def generate_response(user_query: str, faqs=None, rows=None) -> str:
+    """
+    Main reply generator used by app.py.
+    Uses:
+     - exact FAQ match (token overlap)
+     - Agent.answer fallback
+    """
+    if faqs is None:
+        faqs = load_faqs()
+    if rows is None:
+        rows = load_dataset_csv()
+
+    # exact FAQ heuristic (token overlap)
+    qtokens = set((user_query or "").lower().split())
+    if qtokens:
+        best = None
+        best_score = 0
+        for f in faqs:
+            qt = set(str(f.get("question","")).lower().split())
+            sc = len(qtokens & qt)
+            if sc > best_score:
+                best_score = sc
+                best = f
+        if best and best_score > 0:
+            return best.get("answer","")
+
+    # else use Agent's semantic/heuristic answerer
+    ag = _get_agent()
+    try:
+        return ag.answer(user_query)
+    except Exception:
+        # last resort fallback
+        return "Sorry — I don't have an answer right now. Please contact HR at payroll@company.com."

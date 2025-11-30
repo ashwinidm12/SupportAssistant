@@ -1,0 +1,18 @@
+[
+  {
+    "question": "How do I reset my password?",
+    "answer": "Go to Settings → Account → Reset Password. You will receive a reset link on your registered email."
+  },
+  {
+    "question": "What are the working hours?",
+    "answer": "Our standard working hours are Monday to Friday, 9:30 AM to 6:30 PM."
+  },
+  {
+    "question": "How do I request leave?",
+    "answer": "Open the HR portal, select Leave Request, choose dates and reason, then submit. Your manager will be notified."
+  },
+  {
+    "question": "Who do I contact for payroll issues?",
+    "answer": "Please email payroll@company.com with your employee ID and the payroll month in the subject line."
+  }
+]
