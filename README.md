@@ -269,23 +269,6 @@ Select app.py
 
 Deploy
 
-🎤 Viva / Panel Member Answers
-Q: Why is there spacing in UI?
-
-Because Streamlit injects container padding; we override with CSS to reduce spacing.
-
-Q: Why mic may not work in some browsers?
-
-Because microphone API requires HTTPS or localhost.
-Mobile browsers restrict MediaRecorder; fallback exists via file upload.
-
-Q: What if API keys are invalid?
-
-The system automatically falls back to offline FAQ mode, ensuring 100% availability.
-
-Q: Why choose Streamlit?
-
-Fast prototyping, clean UI, built-in state management
 
 🧾 License
 
